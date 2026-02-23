@@ -15,8 +15,8 @@ services:
 
   app:
     build: .
-    expose:
-      - "8000:8000"
+    ports:
+      - 8000:8000
     environment:
       DATABASE_URL: postgresql+asyncpg://metro:metro@db:5432/metro
       ADMIN_API_KEY: ${ADMIN_API_KEY}
