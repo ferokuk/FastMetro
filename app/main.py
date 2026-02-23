@@ -103,11 +103,12 @@ async def shortest_path(
     )
 
 
-# Станции, которые не показываем на графе
-def _is_hidden_station(name: str, line_name: str) -> bool:
-    if name in ("Деловой центр", "Шелепиха"):
-        return "Большая" in line_name and "кольцев" in line_name
-    return False
+# Станции, которые не показываем на графе (по id)
+HIDDEN_STATION_IDS = {
+    "97.603",   # Деловой центр (БКЛ)
+    "97.602",   # Шелепиха (БКЛ)
+    "136.896",  # Ермакова Роща (МЦД-4)
+}
 
 
 @app.get("/graph", response_model=GraphResponse)
@@ -121,7 +122,7 @@ async def full_graph(db: AsyncSession = Depends(get_db)):
 
     stations_filtered = [
         s for s in stations
-        if not _is_hidden_station(s.name, s.line_name)
+        if s.id not in HIDDEN_STATION_IDS
     ]
     allowed_ids = {s.id for s in stations_filtered}
 
