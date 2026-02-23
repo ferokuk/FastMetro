@@ -17,6 +17,7 @@ class Station(Base):
     lng = Column(Float, nullable=False)
     line_id = Column(String(16), nullable=False)
     line_name = Column(String(128), nullable=False)
+    line_color = Column(String(7), nullable=False, server_default="#888888")
     order = Column(Integer, nullable=False)
 
 
