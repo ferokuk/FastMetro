@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     # Время в пути (мок): минуты
     minutes_per_segment: float = 3.0   # перегон между двумя станциями
     minutes_per_transfer: float = 6.0  # переход
+    admin_api_key: str = ""
 
     class Config:
         env_file = ".env"

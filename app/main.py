@@ -1,8 +1,9 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi import FastAPI, Depends, HTTPException, Query, Header
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database import get_db, engine, Base, AsyncSessionLocal
 from app.schemas import PathResponse, PathStep, StationOut, GraphResponse
 from app.services.metro import enrich_database, get_shortest_path
@@ -29,8 +30,13 @@ async def health():
 
 
 @app.post("/admin/refresh")
-async def refresh_metro(db: AsyncSession = Depends(get_db)):
+async def refresh_metro(
+    db: AsyncSession = Depends(get_db),
+    x_api_key: str = Header(alias="X-API-Key", default=""),
+):
     """Обновить данные из API HH и пересчитать переходы и поездки."""
+    if not settings.admin_api_key or x_api_key != settings.admin_api_key:
+        raise HTTPException(status_code=403, detail="Invalid or missing API key")
     stations_count, trips_count = await enrich_database(db)
     return {"stations": stations_count, "trips": trips_count}
 
