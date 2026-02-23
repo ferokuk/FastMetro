@@ -4,22 +4,18 @@ from fastapi import FastAPI, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db, engine, Base, AsyncSessionLocal
-from app.schemas import PathResponse, PathStep, StationOut
+from app.schemas import PathResponse, PathStep, StationOut, GraphResponse
 from app.services.metro import enrich_database, get_shortest_path
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create tables
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    # Optionally fill DB on startup (if empty)
     async with AsyncSessionLocal() as session:
-        from sqlalchemy import select, func
-        from app.models import Station
-        r = await session.execute(select(func.count()).select_from(Station))
-        if r.scalar() == 0:
-            await enrich_database(session)
+        # Всегда пересобираем данные метро при старте,
+        # чтобы применялись COORDINATE_FIXES и EDGE_* патчи.
+        await enrich_database(session)
     yield
     await engine.dispose()
 
@@ -52,7 +48,15 @@ async def list_stations(
         q = q.where(Station.name.ilike(f"%{search}%"))
     result = await db.execute(q)
     stations = result.scalars().unique().all()[:limit]
-    return [StationOut(id=s.id, name=s.name, line_name=s.line_name) for s in stations]
+    return [
+        StationOut(
+            id=s.id,
+            name=s.name,
+            line_name=s.line_name,
+            line_color=s.line_color,
+        )
+        for s in stations
+    ]
 
 
 @app.get("/path", response_model=PathResponse)
@@ -83,14 +87,66 @@ async def shortest_path(
             id=result["from_station"].id,
             name=result["from_station"].name,
             line_name=result["from_station"].line_name,
+            line_color=result["from_station"].line_color,
         ),
         to_station=StationOut(
             id=result["to_station"].id,
             name=result["to_station"].name,
             line_name=result["to_station"].line_name,
+            line_color=result["to_station"].line_color,
         ),
         path=steps,
         total_steps=len(steps) - 1,
         stations_count=len(steps),
+        transfers_count=sum(1 for s in steps if s.is_transfer),
         total_time_minutes=result["total_minutes"],
     )
+
+
+# Станции, которые не показываем на графе
+def _is_hidden_station(name: str, line_name: str) -> bool:
+    if name in ("Деловой центр", "Шелепиха"):
+        return "Большая" in line_name and "кольцев" in line_name
+    return False
+
+
+@app.get("/graph", response_model=GraphResponse)
+async def full_graph(db: AsyncSession = Depends(get_db)):
+    """Полный граф метро: все станции и рёбра между ними."""
+    from sqlalchemy import select
+    from app.models import Station, Trip, EdgeType
+
+    stations_result = await db.execute(select(Station))
+    stations = stations_result.scalars().unique().all()
+
+    stations_filtered = [
+        s for s in stations
+        if not _is_hidden_station(s.name, s.line_name)
+    ]
+    allowed_ids = {s.id for s in stations_filtered}
+
+    trips_result = await db.execute(select(Trip))
+    trips = trips_result.scalars().unique().all()
+
+    stations_out = [
+        {
+            "id": s.id,
+            "name": s.name,
+            "line_id": s.line_id,
+            "line_name": s.line_name,
+            "line_color": s.line_color,
+            "lat": s.lat,
+            "lng": s.lng,
+        }
+        for s in stations_filtered
+    ]
+    edges_out = [
+        {
+            "from_id": t.from_station_id,
+            "to_id": t.to_station_id,
+            "is_transfer": t.edge_type == EdgeType.transfer,
+        }
+        for t in trips
+        if t.from_station_id in allowed_ids and t.to_station_id in allowed_ids
+    ]
+    return GraphResponse(stations=stations_out, edges=edges_out)
