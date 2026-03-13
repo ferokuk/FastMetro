@@ -212,3 +212,6 @@ dist/
 .vite/
 *.local
 *.tsbuildinfo
+
+# OwnYourCode - personal career tracking
+ownyourcode/career/

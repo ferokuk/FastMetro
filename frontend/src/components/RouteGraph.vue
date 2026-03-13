@@ -215,6 +215,7 @@ function buildGraph() {
       {
         selector: "node",
         style: {
+          events: "no",
           "background-color": "data(color)" as any,
           "border-width": 1,
           "border-color": "rgba(0,0,0,0.4)",
@@ -329,36 +330,10 @@ function buildGraph() {
     pixelRatio: Math.max(window.devicePixelRatio || 1, 2),
     wheelSensitivity: 1.0,
     boxSelectionEnabled: false,
-    autoungrabifyNodes: window.innerWidth <= 640,
+    autoungrabifyNodes: true,
     textureOnViewport: false,
     hideEdgesOnViewport: false,
     hideLabelsOnViewport: false,
-  });
-
-  // При перетаскивании хаба — двигаем все групповые узлы (к ним привязаны рёбра)
-  cy.on("drag", "node.hub", (evt) => {
-    const node = evt.target;
-    const pos = node.position();
-    const stationIds: string[] = node.data("stationIds") || [];
-    stationIds.forEach((sid) => {
-      const n = cy!.getElementById(sid);
-      if (n.length) n.position(pos);
-    });
-  });
-  // При перетаскивании группового узла — двигаем хаб и остальные узлы той же группы
-  cy.on("drag", "node.grouped", (evt) => {
-    const node = evt.target;
-    const pos = node.position();
-    const name = idToName.get(node.id());
-    if (!name) return;
-    const hubId = "hub-" + name.replace(/[^a-zA-Zа-яёА-Я0-9]+/g, "_").replace(/^_|_$/g, "");
-    const hub = cy!.getElementById(hubId);
-    if (hub.length) hub.position(pos);
-    const sameNameIds = graph.stations.filter((s) => s.name === name).map((s) => s.id);
-    sameNameIds.forEach((sid) => {
-      const n = cy!.getElementById(sid);
-      if (n.length && n.id() !== node.id()) n.position(pos);
-    });
   });
 
   cy.ready(() => {
