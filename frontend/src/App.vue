@@ -6,6 +6,8 @@
       :path="currentPath"
     />
 
+    <FactorsPanel />
+
     <section class="control-panel">
       <header class="control-panel-header">
         <h1 class="control-panel-title">FastMetro</h1>
@@ -75,6 +77,7 @@ import StationSelect from "./components/StationSelect.vue";
 import RouteGraph from "./components/RouteGraph.vue";
 import RouteSummary from "./components/RouteSummary.vue";
 import ErrorBanner from "./components/ErrorBanner.vue";
+import FactorsPanel from "./components/FactorsPanel.vue";
 
 const stations = ref<Station[]>([]);
 const fromStationId = ref<string | null>(null);

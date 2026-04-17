@@ -5,11 +5,31 @@ export interface Station {
   line_color: string;
 }
 
+export type FactorType = "rush_hour" | "weekend" | "line" | "weather";
+
 export interface PathStep {
   station_id: string;
   station_name: string;
   line_name: string;
   is_transfer: boolean;
+  base_minutes?: number | null;
+  multiplier?: number | null;
+  final_minutes?: number | null;
+  factors_applied: string[];
+}
+
+export interface AppliedFactor {
+  name: string;
+  type: FactorType;
+  multiplier: number;
+  segments_affected: number;
+}
+
+export interface RouteContext {
+  evaluated_at: string;
+  weekday: number;
+  hour: number;
+  weather: string;
 }
 
 export interface PathResponse {
@@ -20,6 +40,9 @@ export interface PathResponse {
   stations_count: number;
   transfers_count: number;
   total_time_minutes: number;
+  base_total_minutes: number;
+  applied_factors_summary: AppliedFactor[];
+  context: RouteContext;
 }
 
 export interface HealthResponse {
@@ -52,3 +75,29 @@ export interface GraphResponse {
   edges: GraphEdge[];
 }
 
+export interface Factor {
+  id: number;
+  name: string;
+  factor_type: FactorType;
+  multiplier: number;
+  applies_to_segment: boolean;
+  applies_to_transfer: boolean;
+  line_id: string | null;
+  hour_start: number | null;
+  hour_end: number | null;
+  weekday_mask: number | null;
+  weather_condition: string | null;
+  is_active: boolean;
+  priority: number;
+}
+
+export type FactorUpdate = Omit<Factor, "id">;
+
+export type WeatherCondition = "clear" | "rain" | "snow" | "fog";
+export type WeatherSource = "manual" | "openweather";
+
+export interface WeatherState {
+  condition: WeatherCondition;
+  source: WeatherSource;
+  updated_at: string | null;
+}

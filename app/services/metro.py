@@ -1,12 +1,18 @@
 import heapq
 import httpx
+from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models import Station, Trip, EdgeType
+from app.models import AdminState, EdgeType, RouteFactor, Station, Trip
+from app.services.factors import (
+    EdgeContext,
+    QueryContext,
+    compute_edge_minutes,
+)
 
 
 async def fetch_metro_from_api() -> dict:
@@ -47,6 +53,16 @@ def _apply_station_fixes(stations: List[Station]) -> None:
 #
 # Словарь станций, которые нужно добавить в БД вручную (МЦД, МЦК и т.д.).
 # Поля: id (уникальный), name, line_id, line_name, line_color, lat, lng, order.
+
+# Станции, которые не должны существовать в БД (дубликаты / упразднённые).
+# Каховская линия (line_id=11) была полностью включена в БКЛ в 2021–2023,
+# поэтому все её станции — дубликаты БКЛ-версий и не должны показываться.
+STATIONS_REMOVE: set[str] = {
+    "11.26",  # Варшавская (БКЛ-версия: 97.824)
+    "11.44",  # Каховская  (БКЛ-версия: 97.818)
+    "11.46",  # Каширская  (БКЛ-версия: 97.832)
+}
+
 
 STATIONS_ADD: List[Dict[str, object]] = [
     {
@@ -378,6 +394,8 @@ def _apply_edge_patches(stations: List[Station], trips: List[Trip]) -> List[Trip
     ]
 
     for a, b, et in EDGE_ADD:
+        if a in STATIONS_REMOVE or b in STATIONS_REMOVE:
+            continue
         filtered.append(Trip(from_station_id=a, to_station_id=b, edge_type=et))
         filtered.append(Trip(from_station_id=b, to_station_id=a, edge_type=et))
 
@@ -402,8 +420,11 @@ async def enrich_database(session: AsyncSession) -> Tuple[int, int]:
         hex_color = line.get("hex_color", "888888")
         line_color = f"#{hex_color}" if not hex_color.startswith("#") else hex_color
         for s in line.get("stations", []):
+            sid = str(s["id"])
+            if sid in STATIONS_REMOVE:
+                continue
             st = Station(
-                id=str(s["id"]),
+                id=sid,
                 name=s["name"],
                 lat=float(s["lat"]),
                 lng=float(s["lng"]),
@@ -428,6 +449,8 @@ async def enrich_database(session: AsyncSession) -> Tuple[int, int]:
         for i in range(len(line_stations) - 1):
             a_id = str(line_stations[i]["id"])
             b_id = str(line_stations[i + 1]["id"])
+            if a_id in STATIONS_REMOVE or b_id in STATIONS_REMOVE:
+                continue
             trips.append(
                 Trip(from_station_id=a_id, to_station_id=b_id, edge_type=EdgeType.same_line)
             )
@@ -444,74 +467,162 @@ async def enrich_database(session: AsyncSession) -> Tuple[int, int]:
 
 def build_graph(
     stations: List[Station], trips: List[Trip]
-) -> Dict[str, List[Tuple[str, bool]]]:
-    """Build adjacency list: station_id -> [(neighbor_id, is_transfer), ...]."""
-    graph: Dict[str, List[Tuple[str, bool]]] = {s.id: [] for s in stations}
+) -> Dict[str, List[Tuple[str, bool, str, Optional[str]]]]:
+    """Build adjacency list: station_id -> [(neighbor_id, is_transfer, from_line, to_line_or_None), ...].
+
+    For same_line edges to_line is None (both endpoints share the line).
+    For transfer edges both line ids are stored so factors can match either side.
+    """
+    station_by_id = {s.id: s for s in stations}
+    graph: Dict[str, List[Tuple[str, bool, str, Optional[str]]]] = {s.id: [] for s in stations}
     for t in trips:
         is_transfer = t.edge_type == EdgeType.transfer
-        graph[t.from_station_id].append((t.to_station_id, is_transfer))
+        from_s = station_by_id.get(t.from_station_id)
+        to_s = station_by_id.get(t.to_station_id)
+        if from_s is None or to_s is None:
+            continue
+        from_line = from_s.line_id
+        to_line = to_s.line_id if is_transfer else None
+        graph[t.from_station_id].append((t.to_station_id, is_transfer, from_line, to_line))
     return graph
 
 
-def _edge_minutes(is_transfer: bool) -> float:
+def _base_minutes(is_transfer: bool) -> float:
     return settings.minutes_per_transfer if is_transfer else settings.minutes_per_segment
 
 
 def shortest_path_by_time(
-    graph: Dict[str, List[Tuple[str, bool]]],
+    graph: Dict[str, List[Tuple[str, bool, str, Optional[str]]]],
     station_by_id: Dict[str, Station],
     start_id: str,
     end_id: str,
-) -> Optional[Tuple[List[Tuple[str, bool]], float]]:
+    qctx: QueryContext,
+    factors: List[RouteFactor],
+) -> Optional[Tuple[List[Tuple[str, bool]], float, float, List[dict]]]:
     """
-    Кратчайший путь по времени в пути (Дейкстра).
-    Мок: 3 мин — перегон, 6 мин — переход.
-    Returns (path, total_minutes) or None. path = [(station_id, is_transfer_into_this_station), ...].
+    Кратчайший путь по времени с учётом динамических факторов (Dijkstra).
+
+    Returns (path, total_minutes, base_total_minutes, edge_breakdown) or None.
+    - path: [(station_id, is_transfer_into_this_station), ...]
+    - edge_breakdown: parallel to path[1:], each: {base, multiplier, final, factors: [names]}
     """
     if start_id not in graph or end_id not in graph:
         return None
     if start_id == end_id:
-        return ([(start_id, False)], 0.0)
+        return ([(start_id, False)], 0.0, 0.0, [])
 
-    # (total_time, node_id, path)
+    # Per-request cache: (from_line, to_line, is_transfer) -> (base, final, applied_names)
+    edge_cache: Dict[Tuple[str, Optional[str], bool], Tuple[float, float, List[str]]] = {}
+
+    def edge_weight(
+        from_line: str, to_line: Optional[str], is_transfer: bool
+    ) -> Tuple[float, float, List[str]]:
+        # Normalize transfer key so direction doesn't matter for caching
+        if is_transfer and to_line is not None:
+            a, b_ = sorted([from_line, to_line])
+            key: Tuple[str, Optional[str], bool] = (a, b_, True)
+        else:
+            key = (from_line, None, False)
+        cached = edge_cache.get(key)
+        if cached is not None:
+            return cached
+        base = _base_minutes(is_transfer)
+        b_val, final, applied = compute_edge_minutes(
+            base,
+            EdgeContext(line_id=from_line, is_transfer=is_transfer, other_line_id=to_line),
+            qctx,
+            factors,
+        )
+        names = [f.name for f in applied]
+        edge_cache[key] = (b_val, final, names)
+        return b_val, final, names
+
+    # heap entries: (total_time, node_id, path, base_total, breakdown)
     best: Dict[str, float] = {start_id: 0.0}
-    heap: List[Tuple[float, str, List[Tuple[str, bool]]]] = [(0.0, start_id, [(start_id, False)])]
+    heap: List[
+        Tuple[float, str, List[Tuple[str, bool]], float, List[dict]]
+    ] = [(0.0, start_id, [(start_id, False)], 0.0, [])]
     while heap:
-        time_cur, cur, path = heapq.heappop(heap)
+        time_cur, cur, path, base_cur, breakdown = heapq.heappop(heap)
         if cur == end_id:
-            return (path, time_cur)
+            return (path, time_cur, base_cur, breakdown)
         if time_cur > best.get(cur, float("inf")):
             continue
-        for neighbor, is_transfer in graph[cur]:
-            w = _edge_minutes(is_transfer)
-            time_next = time_cur + w
+        for neighbor, is_transfer, from_line, to_line in graph[cur]:
+            b, final, names = edge_weight(from_line, to_line, is_transfer)
+            time_next = time_cur + final
             if time_next < best.get(neighbor, float("inf")):
                 best[neighbor] = time_next
-                heapq.heappush(heap, (time_next, neighbor, path + [(neighbor, is_transfer)]))
+                multiplier = (final / b) if b > 0 else 1.0
+                new_breakdown = breakdown + [{
+                    "base": b,
+                    "multiplier": multiplier,
+                    "final": final,
+                    "factors": names,
+                }]
+                heapq.heappush(
+                    heap,
+                    (
+                        time_next,
+                        neighbor,
+                        path + [(neighbor, is_transfer)],
+                        base_cur + b,
+                        new_breakdown,
+                    ),
+                )
     return None
 
 
+async def _load_admin_state(session: AsyncSession) -> str:
+    res = await session.execute(select(AdminState).where(AdminState.id == 1))
+    row = res.scalars().first()
+    if row is None:
+        return "clear"
+    return row.current_weather or "clear"
+
+
 async def get_shortest_path(
-    session: AsyncSession, from_station_id: str, to_station_id: str
+    session: AsyncSession,
+    from_station_id: str,
+    to_station_id: str,
+    now: Optional[datetime] = None,
+    weather_override: Optional[str] = None,
 ) -> Optional[dict]:
-    """Load stations and trips, compute shortest path, return path info for response."""
+    """Load stations, trips, factors, and admin state; compute shortest path."""
     st_stations = await session.execute(select(Station))
     stations = list(st_stations.scalars().all())
     st_trips = await session.execute(select(Trip))
     trips = list(st_trips.scalars().all())
 
+    factors_res = await session.execute(
+        select(RouteFactor).where(RouteFactor.is_active == True)  # noqa: E712
+    )
+    factors = list(factors_res.scalars().all())
+
+    current_weather = weather_override or await _load_admin_state(session)
+    evaluated_at = now or datetime.now()
+    qctx = QueryContext(now=evaluated_at, weather=current_weather)
+
     station_by_id = {s.id: s for s in stations}
     graph = build_graph(stations, trips)
     result_path = shortest_path_by_time(
-        graph, station_by_id, from_station_id, to_station_id
+        graph, station_by_id, from_station_id, to_station_id, qctx, factors
     )
     if not result_path:
         return None
-    path, total_minutes = result_path
+    path, total_minutes, base_total, breakdown = result_path
     return {
         "path": path,
         "total_minutes": total_minutes,
+        "base_total_minutes": base_total,
+        "edge_breakdown": breakdown,
         "station_by_id": station_by_id,
         "from_station": station_by_id[from_station_id],
         "to_station": station_by_id[to_station_id],
+        "context": {
+            "evaluated_at": evaluated_at,
+            "weekday": evaluated_at.weekday(),
+            "hour": evaluated_at.hour,
+            "weather": current_weather,
+        },
     }
