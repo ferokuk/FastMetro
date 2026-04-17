@@ -1,9 +1,12 @@
 import type {
+  Factor,
+  FactorUpdate,
   GraphResponse,
   HealthResponse,
   PathResponse,
   RefreshResponse,
-  Station
+  Station,
+  WeatherState
 } from "../types/api";
 
 const API_BASE_URL =
@@ -43,13 +46,28 @@ export async function fetchStations(limit = 500, search?: string): Promise<Stati
   return request<Station[]>(`/stations${query ? `?${query}` : ""}`);
 }
 
-export async function fetchPath(fromId: string, toId: string): Promise<PathResponse> {
+export interface FetchPathOptions {
+  overrideTime?: string;
+  overrideWeather?: string;
+  apiKey?: string;
+}
+
+export async function fetchPath(
+  fromId: string,
+  toId: string,
+  opts?: FetchPathOptions
+): Promise<PathResponse> {
   const params = new URLSearchParams({
     from_id: fromId,
     to_id: toId
   });
+  if (opts?.overrideTime) params.set("override_time", opts.overrideTime);
+  if (opts?.overrideWeather) params.set("override_weather", opts.overrideWeather);
   const query = params.toString();
-  return request<PathResponse>(`/path?${query}`);
+  const init: RequestInit | undefined = opts?.apiKey
+    ? { headers: { "Content-Type": "application/json", "X-API-Key": opts.apiKey } }
+    : undefined;
+  return request<PathResponse>(`/path?${query}`, init);
 }
 
 export async function refreshMetro(): Promise<RefreshResponse> {
@@ -60,5 +78,42 @@ export async function refreshMetro(): Promise<RefreshResponse> {
 
 export async function fetchGraph(): Promise<GraphResponse> {
   return request<GraphResponse>("/graph");
+}
+
+export async function fetchFactors(): Promise<Factor[]> {
+  return request<Factor[]>("/factors");
+}
+
+export async function updateFactor(
+  id: number,
+  payload: FactorUpdate,
+  apiKey: string
+): Promise<Factor> {
+  return request<Factor>(`/admin/factors/${id}`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      "X-API-Key": apiKey
+    },
+    body: JSON.stringify(payload)
+  });
+}
+
+export async function fetchWeather(): Promise<WeatherState> {
+  return request<WeatherState>("/weather");
+}
+
+export async function setWeather(
+  condition: string,
+  apiKey: string
+): Promise<WeatherState> {
+  return request<WeatherState>("/admin/weather", {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      "X-API-Key": apiKey
+    },
+    body: JSON.stringify({ condition })
+  });
 }
 
